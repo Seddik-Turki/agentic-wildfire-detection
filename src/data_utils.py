@@ -2,40 +2,45 @@ from pathlib import Path
 import re
 
 from PIL import ImageDraw
-from tqdm.auto import tqdm
 
-from constants import NAMES, W, H
+from .constants import NAMES, W, H
 
-R = Path(__file__).parent / "rgbt-3m"
+# Single source of truth. This previously resolved to src/rgbt-3m while
+# main.py resolved <root>/rgbt-3m, so labels and images came from different
+# directories.
+R = Path(__file__).parents[1] / "rgbt-3m"
+
 COLORS = {'smoke': (128, 200, 255), 'fire': (255, 80, 0), 'person': (0, 255, 120)}
+VIDEOS = [2, 3, 4, 5]
 
-def load_frames():
-    frames = dict()
 
-    for vid_id in [2,3,4,5]:
-        VID = f'video{vid_id}'
-        frames[VID] = []
-
-    for vid_id in tqdm([2,3,4,5]):
-        VID = f'video{vid_id}'
-        
-        for split in tqdm(['train', 'test'], leave=False):
-            for p in tqdm((R/f'labels/{split}').glob(f'{VID}_frame_*.txt'), leave=False):
+def load_frames(videos=VIDEOS, verbose=True):
+    """-> {'video2': [(frame_idx, stem, split), ...], ...}, sorted by frame."""
+    frames = {}
+    for vid_id in videos:
+        vid = f'video{vid_id}'
+        found = []
+        for split in ('train', 'test'):
+            for p in (R / f'labels/{split}').glob(f'{vid}_frame_*.txt'):
                 idx = int(re.search(r'frame_(\d+)', p.stem).group(1))
-                frames[VID].append((idx, p.stem, split))
-
-        print(f"[{VID}] {len(frames[VID])}")
+                found.append((idx, p.stem, split))
+        frames[vid] = sorted(found)
+        if verbose:
+            print(f"[{vid}] {len(frames[vid])}")
+    return frames
 
 
 def load_gt(stem, split):
-    """YOLO normalized cxcywh -> absolute xyxy."""
+    """YOLO normalised cxcywh -> [(label, x1, y1, x2, y2), ...] absolute px."""
     out = []
     for line in (R / f'labels/{split}/{stem}.txt').read_text().split('\n'):
         t = line.split()
         if len(t) == 5:
             c, cx, cy, w, h = int(t[0]), *map(float, t[1:])
-            out.append((NAMES[c], (cx - w/2)*W, (cy - h/2)*H, (cx + w/2)*W, (cy + h/2)*H))
+            out.append((NAMES[c], (cx - w/2)*W, (cy - h/2)*H,
+                        (cx + w/2)*W, (cy + h/2)*H))
     return out
+
 
 def draw_boxes(img, boxes, width=2):
     """boxes: list of (label, x1, y1, x2, y2). Returns a copy."""

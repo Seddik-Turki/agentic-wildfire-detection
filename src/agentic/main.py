@@ -82,8 +82,8 @@ def main():
     gt = load_gt(stem, split)
 
 
-    rgb = upload(R / f'rgb/{split}/{stem}.jpg', "rgb")
-    th  = upload(R / f'thermal/{split}/{stem}.jpg', "thermal")
+    rgb = upload(client, R / f'rgb/{split}/{stem}.jpg', "rgb")
+    th  = upload(client, R / f'thermal/{split}/{stem}.jpg', "thermal")
 
     messages=[{
         'role': 'user',

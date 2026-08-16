@@ -1,0 +1,736 @@
+From 29146141289a8e62fcea98d310da14056242d2bc Mon Sep 17 00:00:00 2001
+From: Seddik Turki <mohamedseddik.turki@insat.ucar.tn>
+Date: Sun, 16 Aug 2026 01:31:11 +0000
+Subject: [PATCH] Fix blocking bugs, restore stdout cap, add shared evaluator
+
+- load_frames() never returned its result; both entry points crashed
+- data_utils resolved src/rgbt-3m while main.py resolved <root>/rgbt-3m, so
+  labels and images were read from different directories; R now has a single
+  definition that everything imports
+- rename rgbt-3/ -> rgbt-3m/ to match the code
+- upload() was called with 2 of its 3 args in agentic/main.py
+- imports were a mix of top-level and package-absolute and resolved from no
+  entry point; now relative, run with python -m src.<method>.main
+- restore the stdout cap in the agentic prompt (dropping it was worth ~13x on
+  input tokens for one frame), note the thermal is non-radiometric, fix typos
+- trace() ignored thinking blocks while thinking was enabled
+- agentic: extract detect(), delete uploads in finally, cache_control on the
+  first block, per-turn token/tool accounting
+- add src/evaluation/metrics.py: shared mAP + centre-coverage, MAX_DETS=[1,10,300]
+- .gitignore: pycache, artefacts, dataset files
+---
+ .gitignore                   |  20 +++-
+ {rgbt-3 => rgbt-3m}/.gitkeep |   0
+ src/agentic/constants.py     |   3 +-
+ src/agentic/main.py          | 195 ++++++++++++++++++++---------------
+ src/agentic/prompt.py        |  27 ++---
+ src/agentic/utils.py         |  12 ++-
+ src/basic_prompting/main.py  |  64 +++++-------
+ src/constants.py             |   5 +-
+ src/data_utils.py            |  45 ++++----
+ src/evaluation/__init__.py   |   0
+ src/evaluation/metrics.py    |  94 +++++++++++++++++
+ 11 files changed, 307 insertions(+), 158 deletions(-)
+ rename {rgbt-3 => rgbt-3m}/.gitkeep (100%)
+ create mode 100644 src/evaluation/__init__.py
+ create mode 100644 src/evaluation/metrics.py
+
+diff --git a/.gitignore b/.gitignore
+index 2eea525..d932509 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,19 @@
+-.env
+\ No newline at end of file
++# secrets
++.env
++
++# python
++__pycache__/
++*.py[cod]
++.ipynb_checkpoints/
++.venv/
++venv/
++
++# dataset (research-use licence — see README)
++rgbt-3m/*
++!rgbt-3m/.gitkeep
++
++# artefacts
++cache/
++results/
++agentic_raw/
++*.npz
+diff --git a/rgbt-3/.gitkeep b/rgbt-3m/.gitkeep
+similarity index 100%
+rename from rgbt-3/.gitkeep
+rename to rgbt-3m/.gitkeep
+diff --git a/src/agentic/constants.py b/src/agentic/constants.py
+index 7bccbb4..eb8e4a1 100644
+--- a/src/agentic/constants.py
++++ b/src/agentic/constants.py
+@@ -1,3 +1,4 @@
+ MAX_TOKENS = 10_000
+ MODEL = "claude-opus-5"
+-BETAS = ["files-api-2025-04-14"]
+\ No newline at end of file
++BETAS = ["files-api-2025-04-14"]
++MAX_TURNS = 12
+diff --git a/src/agentic/main.py b/src/agentic/main.py
+index 0e41123..699e1fa 100644
+--- a/src/agentic/main.py
++++ b/src/agentic/main.py
+@@ -1,54 +1,82 @@
+-from pathlib import Path
+-from tqdm.auto import tqdm
++"""Agentic loop: Claude writes CV code in a container, views the images it
++produces via attach_image, then commits to structured detections.
++
++    python -m src.agentic.main
++"""
+ import random
++
++from dotenv import load_dotenv
+ from PIL import Image
+ import matplotlib.pyplot as plt
++import anthropic
+ 
+-from schema import DetectionResult
+-from data_utils import load_frames, load_gt, draw_boxes
+-
+-from agentic.constants import MAX_TOKENS, MODEL, BETAS
+-from agentic.tools import ATTACH_TOOL, CODE_EXEC_TOOL
+-from agentic.prompt import PROMPT, BBOX_PROMPT
+-from agentic.utils import trace, harvest, attach_image, encode_raw, upload
+-
+-
+-R = Path(__file__).parents[2] / "rgbt-3m"
++from ..data_utils import R, load_frames, load_gt, draw_boxes
++from ..schema import DetectionResult
++from .constants import MAX_TOKENS, MODEL, BETAS, MAX_TURNS
++from .tools import ATTACH_TOOL, CODE_EXEC_TOOL
++from .prompt import PROMPT, BBOX_PROMPT
++from .utils import trace, harvest, attach_image, encode_raw, upload
+ 
+-from dotenv import load_dotenv
+ load_dotenv()
+-
+-import anthropic
+ client = anthropic.Anthropic()
+ 
+ 
+-def run(client, messages):
+-    registry = {}
+-    container = None
++def build_messages(stem, split, rgb_file, thermal_file):
++    return [{
++        'role': 'user',
++        'content': [
++            {'type': 'text', 'text': 'Image 1 — RGB:'},
++            {'type': 'image', 'source': {
++                'type': 'base64', 'media_type': 'image/jpeg',
++                'data': encode_raw(R / f'rgb/{split}/{stem}.jpg')}},
++            {'type': 'text', 'text': 'Image 2 — Thermal (LWIR):'},
++            {'type': 'image', 'source': {
++                'type': 'base64', 'media_type': 'image/jpeg',
++                'data': encode_raw(R / f'thermal/{split}/{stem}.jpg')}},
++            {"type": "container_upload", "file_id": rgb_file.id},
++            {"type": "container_upload", "file_id": thermal_file.id},
++            # cached: the two images plus the prompt are re-sent every turn
++            {'type': 'text', 'text': PROMPT,
++             'cache_control': {'type': 'ephemeral'}},
++        ],
++    }]
++
+ 
++def loop(client, messages, max_turns=MAX_TURNS, verbose=True):
++    """Run the agentic loop. Mutates `messages` in place. -> (registry, turns)."""
++    registry, container, turns = {}, None, []
+ 
+-    for turn in tqdm(range(12)):
+-        print(f"\n{'=' * 60}\nTURN {turn}\n{'=' * 60}")
++    for turn in range(max_turns):
++        if verbose:
++            print(f"\n{'=' * 60}\nTURN {turn}\n{'=' * 60}")
+         kwargs = {"container": container} if container else {}
+-        
++
+         r = client.beta.messages.create(
+-            model=MODEL, 
++            model=MODEL,
+             max_tokens=MAX_TOKENS,
+             thinking={"type": "adaptive", "display": "summarized"},
+             output_config={"effort": "high"},
+-            betas=BETAS, 
+-            
+-            tools=[CODE_EXEC_TOOL,ATTACH_TOOL],
+-            messages=messages, 
++            betas=BETAS,
++            tools=[CODE_EXEC_TOOL, ATTACH_TOOL],
++            messages=messages,
+             **kwargs,
+         )
+-        trace(r)
+-        print(f"stop={r.stop_reason}  tokens={r.usage.input_tokens}in/"
+-              f"{r.usage.output_tokens}out")
++        if verbose:
++            trace(r)
++            print(f"stop={r.stop_reason}  tokens={r.usage.input_tokens}in/"
++                  f"{r.usage.output_tokens}out")
++
++        turns.append(dict(
++            i=turn, stop=r.stop_reason,
++            inp=r.usage.input_tokens, out=r.usage.output_tokens,
++            cache_read=getattr(r.usage, "cache_read_input_tokens", 0) or 0,
++            bash=sum(b.type == "server_tool_use" for b in r.content),
++            attach=sum(b.type == "tool_use" for b in r.content),
++        ))
+ 
+         if r.container:
+             container = r.container.id
+-        harvest(client, r, registry)
++        harvest(client, r, registry, verbose=verbose)
+         messages.append({"role": "assistant", "content": r.content})
+ 
+         if r.stop_reason == "pause_turn":
+@@ -56,7 +84,8 @@ def run(client, messages):
+ 
+         calls = [b for b in r.content if b.type == "tool_use"]
+         if not calls:
+-            print("\n--- DONE ---")
++            if verbose:
++                print("\n--- DONE ---")
+             break
+ 
+         results = []
+@@ -65,58 +94,21 @@ def run(client, messages):
+                 out = attach_image(b.input["filename"], registry)
+             else:
+                 out = {"content": f"Unknown tool: {b.name}", "is_error": True}
+-            print(f"   [result] {b.input.get('filename')} "
+-                  f"{'ERROR: ' + out['content'] if out['is_error'] else 'ok'}")
++            if verbose:
++                print(f"   [result] {b.input.get('filename')} "
++                      f"{'ERROR: ' + out['content'] if out['is_error'] else 'ok'}")
+             results.append({"type": "tool_result", "tool_use_id": b.id, **out})
+         messages.append({"role": "user", "content": results})
++    else:
++        turns.append({"i": max_turns, "stop": "TURN_LIMIT"})
+ 
+-    print("\nregistry:", list(registry))
+-
+-
+-def main():
+-    frames = load_frames()
+-    vid_id = random.choice([2,3,4,5])
+-    _, stem, split = random.choice(frames[f'video{vid_id}'])
+-    img = Image.open(R / f'rgb/{split}/{stem}.jpg').convert('RGB')
+-    thermal = Image.open(R / f'thermal/{split}/{stem}.jpg')
+-    gt = load_gt(stem, split)
+-
+-
+-    rgb = upload(R / f'rgb/{split}/{stem}.jpg', "rgb")
+-    th  = upload(R / f'thermal/{split}/{stem}.jpg', "thermal")
+-
+-    messages=[{
+-        'role': 'user',
+-        'content': [
+-            {'type': 'text', 'text': 'Image 1 — RGB:'},
+-            {'type': 'image', 
+-            'source': {
+-                'type': 'base64', 
+-                'media_type': 'image/jpeg', 
+-                'data': encode_raw(R / f'rgb/{split}/{stem}.jpg')}
+-            },
+-            {'type': 'text', 'text': 'Image 2 — Thermal (LWIR)'},
+-            {'type': 'image', 'source': {
+-                'type': 'base64', 
+-                'media_type': 'image/jpeg', 
+-                'data': encode_raw(R / f'thermal/{split}/{stem}.jpg')}
+-            },
+-            {"type": "container_upload", "file_id": rgb.id},
+-            {"type": "container_upload", "file_id": th.id},
+-            {'type': 'text', 'text': PROMPT},
+-        ],
+-    }]
+-
++    return registry, turns
+ 
+-    run(client, messages)
+-
+-    messages.append({
+-        'role': 'user',
+-        'content': [
+-            {'type': 'text', 'text': BBOX_PROMPT},
+-        ],
+-    })
+ 
++def commit(client, messages):
++    """Final call: no tools, structured output."""
++    messages.append({'role': 'user',
++                     'content': [{'type': 'text', 'text': BBOX_PROMPT}]})
+     r = client.beta.messages.parse(
+         model=MODEL,
+         max_tokens=MAX_TOKENS,
+@@ -124,17 +116,56 @@ def main():
+         output_config={"effort": "high"},
+         output_format=DetectionResult,
+         messages=messages,
+-        betas=BETAS
++        betas=BETAS,
+     )
++    return r.parsed_output.detections, r
++
++
++def detect(stem, split, client=client, verbose=True):
++    """One frame -> (detections, turns). Uploads are deleted afterwards."""
++    rgb = th = None
++    try:
++        rgb = upload(client, R / f'rgb/{split}/{stem}.jpg', "rgb")
++        th = upload(client, R / f'thermal/{split}/{stem}.jpg', "thermal")
++        messages = build_messages(stem, split, rgb, th)
++        _, turns = loop(client, messages, verbose=verbose)
++        dets, r = commit(client, messages)
++        turns.append(dict(i="commit", stop=r.stop_reason,
++                          inp=r.usage.input_tokens, out=r.usage.output_tokens,
++                          cache_read=getattr(r.usage, "cache_read_input_tokens", 0) or 0,
++                          bash=0, attach=0))
++        return dets, turns
++    finally:
++        # uploads persist workspace-wide; without this they accumulate
++        for f in (rgb, th):
++            if f is not None:
++                try:
++                    client.beta.files.delete(f.id)
++                except Exception:
++                    pass
++
+ 
+-    dets = r.parsed_output.detections
++def main():
++    frames = load_frames()
++    _, stem, split = random.choice(frames[f'video{random.choice([2, 3, 4, 5])}'])
++    print(f"frame: {stem} ({split})")
++
++    dets, turns = detect(stem, split)
++    n = len([t for t in turns if t['i'] != 'commit'])
++    print(f"\n{n} turns, {sum(t.get('bash', 0) for t in turns)} bash, "
++          f"{sum(t.get('attach', 0) for t in turns)} attach")
++    for d in dets:
++        print(f"  {d.label:7} {d.confidence:.2f}  {d.box}")
++
++    img = Image.open(R / f'rgb/{split}/{stem}.jpg').convert('RGB')
++    gt = load_gt(stem, split)
+     pred = [(d.label, *d.box) for d in dets]
+ 
+     fig, ax = plt.subplots(1, 2, figsize=(14, 5))
+-    ax[0].imshow(draw_boxes(img, gt));   ax[0].set_title(f'GT ({len(gt)})');   ax[0].axis('off')
++    ax[0].imshow(draw_boxes(img, gt));   ax[0].set_title(f'GT ({len(gt)})');       ax[0].axis('off')
+     ax[1].imshow(draw_boxes(img, pred)); ax[1].set_title(f'Claude ({len(pred)})'); ax[1].axis('off')
+     plt.tight_layout(); plt.show()
+ 
+ 
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
+diff --git a/src/agentic/prompt.py b/src/agentic/prompt.py
+index b122152..facfd21 100644
+--- a/src/agentic/prompt.py
++++ b/src/agentic/prompt.py
+@@ -6,6 +6,7 @@ You have two co-registered 640x480 frames of the same scene, captured simultaneo
+ 
+ - **Image 1 — RGB**: visible-spectrum view. Use for colour, texture, shape, and scene context.
+ - **Image 2 — Thermal (LWIR)**: same field of view, pixel-aligned with Image 1. Brighter pixels are hotter.
++  This is an 8-bit grayscale JPEG, NOT radiometric — intensity is relative, not temperature.
+ 
+ Both images cover the identical field of view, so a pixel at (x, y) in one corresponds to (x, y) in the other. Report all coordinates in this shared 640x480 space.
+ 
+@@ -14,16 +15,19 @@ Both images are attached as files in your container:
+  - thermal.jpg
+ ==================================
+ 
+-
+-============== Ressources ==============
+-
+-You have access to python code container,
+- - use it if it can help you better undersatnd the images
+-   or check results, or whatever it helps you in the prediction
+-- To view any image you produce, save it and `cp` it into "$OUTPUT_DIR" in the
+-  SAME bash command, then call attach_image(filename) in a SEPARATE later turn.
+-  Never call attach_image in the same turn as a bash command.
+-- Use unique descriptive filenames: rgb_code_1.png, thermal_mask_2.png, etc.
++============== Resources ==============
++You have access to a Python code container.
++ - Use it wherever measuring something helps: thresholds, connected components,
++   colour statistics, masks, overlays, magnified crops. numpy, scipy, PIL and
++   matplotlib are available; there is no cv2 (use scipy.ndimage).
++ - To view any image you produce, save it and `cp` it into "$OUTPUT_DIR" in the
++   SAME bash command, then call attach_image(filename) in a SEPARATE later turn.
++   Never call attach_image in the same turn as a bash command.
++ - Use unique descriptive filenames: rgb_code_1.png, thermal_mask_2.png, etc.
++
++Hard rule: never print an array, a table, or more than 10 lines of stdout per
++command. Print summary statistics only. Long output is re-sent on every
++subsequent turn and will dominate the cost of the run.
+ ==================================
+ 
+ ============== Goal ==============
+@@ -33,7 +37,6 @@ Coordinates must be absolute pixels in this 640x480 image (origin top-left, x ri
+ Confidence must be between 0.0 and 1.0.
+ For each detection, explain in `description` what visual evidence led to the call.
+ ==================================
+-
+ """
+ 
+ BBOX_PROMPT = """
+@@ -43,4 +46,4 @@ Coordinates must be absolute pixels in this 640x480 image (origin top-left, x ri
+ Confidence must be between 0.0 and 1.0.
+ For each detection, explain in `description` what visual evidence led to the call.
+ If nothing is present, return an empty detections list.
+-"""
+\ No newline at end of file
++"""
+diff --git a/src/agentic/utils.py b/src/agentic/utils.py
+index 19f01d5..0b2a446 100644
+--- a/src/agentic/utils.py
++++ b/src/agentic/utils.py
+@@ -1,7 +1,7 @@
+ from pathlib import Path
+ import base64
+ 
+-from agentic.constants import BETAS
++from .constants import BETAS
+ 
+ def encode_raw(path):
+     """Send original JPEG bytes — no re-encode, no second lossy pass."""
+@@ -16,7 +16,7 @@ def upload(client, path, label):
+         )
+ 
+ 
+-def harvest(client, response, registry):
++def harvest(client, response, registry, verbose=True):
+     """Add every file the container captured to the filename -> file_id map."""
+     for block in response.content:
+         if block.type != "bash_code_execution_tool_result":
+@@ -27,7 +27,8 @@ def harvest(client, response, registry):
+         for out in c.content:
+             meta = client.beta.files.retrieve_metadata(out.file_id)
+             registry[meta.filename] = out.file_id
+-            print(f"   [registry] {meta.filename} -> {out.file_id}")
++            if verbose:
++                print(f"   [registry] {meta.filename} -> {out.file_id}")
+ 
+ 
+ def attach_image(filename, registry):
+@@ -50,7 +51,10 @@ def attach_image(filename, registry):
+ 
+ def trace(response):
+     for b in response.content:
+-        if b.type == "text":
++        if b.type in ("thinking", "redacted_thinking"):
++            txt = getattr(b, "thinking", "") or "[redacted]"
++            print("[think]", txt[:400])
++        elif b.type == "text":
+             print("[text]", b.text)
+         elif b.type == "server_tool_use":
+             print("[bash]", b.input.get("command", b.input))
+diff --git a/src/basic_prompting/main.py b/src/basic_prompting/main.py
+index 1bdaff0..617cfde 100644
+--- a/src/basic_prompting/main.py
++++ b/src/basic_prompting/main.py
+@@ -1,28 +1,26 @@
+-from pathlib import Path
++"""Single-shot baseline: one request, both modalities, structured output.
++
++    python -m src.basic_prompting.main
++"""
+ import random
+ 
++from dotenv import load_dotenv
+ from PIL import Image
+ import matplotlib.pyplot as plt
++import anthropic
+ 
+-from data_utils import load_frames, load_gt, draw_boxes
+-from schema import DetectionResult
+-
+-from basic_prompting.utils import encode_raw
+-from basic_prompting.prompt import PROMPT
+-from basic_prompting.constants import MODEL, MAX_TOKENS
+-
+-R = Path(__file__).parents[2] / "rgbt-3m"
+-
+-from dotenv import load_dotenv
++from ..data_utils import R, load_frames, load_gt, draw_boxes
++from ..schema import DetectionResult
++from .utils import encode_raw
++from .prompt import PROMPT
++from .constants import MODEL, MAX_TOKENS
+ 
+ load_dotenv()
+-
+-import anthropic
+-
+ client = anthropic.Anthropic()
+ 
+ 
+-def detect(split, stem):
++def detect(stem, split, client=client):
++    """One frame -> (detections, raw response)."""
+     r = client.messages.parse(
+         model=MODEL,
+         max_tokens=MAX_TOKENS,
+@@ -33,18 +31,13 @@ def detect(split, stem):
+             'role': 'user',
+             'content': [
+                 {'type': 'text', 'text': 'Image 1 — RGB:'},
+-                {'type': 'image', 
+-                 'source': {
+-                    'type': 'base64', 
+-                     'media_type': 'image/jpeg', 
+-                     'data': encode_raw(R / f'rgb/{split}/{stem}.jpg')}
+-                },
+-                {'type': 'text', 'text': 'Image 2 — Thermal (LWIR)'},
+                 {'type': 'image', 'source': {
+-                    'type': 'base64', 
+-                    'media_type': 'image/jpeg', 
+-                    'data': encode_raw(R / f'thermal/{split}/{stem}.jpg')}
+-                },
++                    'type': 'base64', 'media_type': 'image/jpeg',
++                    'data': encode_raw(R / f'rgb/{split}/{stem}.jpg')}},
++                {'type': 'text', 'text': 'Image 2 — Thermal (LWIR):'},
++                {'type': 'image', 'source': {
++                    'type': 'base64', 'media_type': 'image/jpeg',
++                    'data': encode_raw(R / f'thermal/{split}/{stem}.jpg')}},
+                 {'type': 'text', 'text': PROMPT},
+             ],
+         }],
+@@ -54,24 +47,23 @@ def detect(split, stem):
+ 
+ def main():
+     frames = load_frames()
+-    vid_id = random.choice([2,3,4,5])
+-    _, stem, split = random.choice(frames[f'video{vid_id}'])
+-    img = Image.open(R / f'rgb/{split}/{stem}.jpg').convert('RGB')
+-    # thermal = Image.open(R / f'thermal/{split}/{stem}.jpg')
+-    gt = load_gt(stem, split)
+-
++    _, stem, split = random.choice(frames[f'video{random.choice([2, 3, 4, 5])}'])
++    print(f"frame: {stem} ({split})")
+ 
+-    dets, resp = detect(split, stem)
+-    print(dets)
++    dets, resp = detect(stem, split)
+     print('tokens:', resp.usage.input_tokens, '->', resp.usage.output_tokens)
++    for d in dets:
++        print(f"  {d.label:7} {d.confidence:.2f}  {d.box}")
+ 
++    img = Image.open(R / f'rgb/{split}/{stem}.jpg').convert('RGB')
++    gt = load_gt(stem, split)
+     pred = [(d.label, *d.box) for d in dets]
+ 
+     fig, ax = plt.subplots(1, 2, figsize=(14, 5))
+-    ax[0].imshow(draw_boxes(img, gt));   ax[0].set_title(f'GT ({len(gt)})');   ax[0].axis('off')
++    ax[0].imshow(draw_boxes(img, gt));   ax[0].set_title(f'GT ({len(gt)})');       ax[0].axis('off')
+     ax[1].imshow(draw_boxes(img, pred)); ax[1].set_title(f'Claude ({len(pred)})'); ax[1].axis('off')
+     plt.tight_layout(); plt.show()
+ 
+ 
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
+diff --git a/src/constants.py b/src/constants.py
+index 249f8b6..f9a08b4 100644
+--- a/src/constants.py
++++ b/src/constants.py
+@@ -1,2 +1,3 @@
+-NAMES = {0:'smoke', 1:'fire', 2:'person'}
+-W, H = 640, 480
+\ No newline at end of file
++NAMES = {0: 'smoke', 1: 'fire', 2: 'person'}
++CLS = {v: k for k, v in NAMES.items()}
++W, H = 640, 480
+diff --git a/src/data_utils.py b/src/data_utils.py
+index 35371d1..7dfb831 100644
+--- a/src/data_utils.py
++++ b/src/data_utils.py
+@@ -2,41 +2,46 @@ from pathlib import Path
+ import re
+ 
+ from PIL import ImageDraw
+-from tqdm.auto import tqdm
+ 
+-from constants import NAMES, W, H
++from .constants import NAMES, W, H
+ 
+-R = Path(__file__).parent / "rgbt-3m"
+-COLORS = {'smoke': (128, 200, 255), 'fire': (255, 80, 0), 'person': (0, 255, 120)}
++# Single source of truth for the dataset root. Every module imports R from
++# here — three separate definitions previously resolved to two different
++# directories, so labels and images were read from different places.
++R = Path(__file__).parents[1] / "rgbt-3m"
+ 
+-def load_frames():
+-    frames = dict()
++COLORS = {'smoke': (128, 200, 255), 'fire': (255, 80, 0), 'person': (0, 255, 120)}
++VIDEOS = [2, 3, 4, 5]
+ 
+-    for vid_id in [2,3,4,5]:
+-        VID = f'video{vid_id}'
+-        frames[VID] = []
+ 
+-    for vid_id in tqdm([2,3,4,5]):
+-        VID = f'video{vid_id}'
+-        
+-        for split in tqdm(['train', 'test'], leave=False):
+-            for p in tqdm((R/f'labels/{split}').glob(f'{VID}_frame_*.txt'), leave=False):
++def load_frames(videos=VIDEOS, verbose=True):
++    """-> {'video2': [(frame_idx, stem, split), ...], ...}, sorted by frame."""
++    frames = {}
++    for vid_id in videos:
++        vid = f'video{vid_id}'
++        found = []
++        for split in ('train', 'test'):
++            for p in (R / f'labels/{split}').glob(f'{vid}_frame_*.txt'):
+                 idx = int(re.search(r'frame_(\d+)', p.stem).group(1))
+-                frames[VID].append((idx, p.stem, split))
+-
+-        print(f"[{VID}] {len(frames[VID])}")
++                found.append((idx, p.stem, split))
++        frames[vid] = sorted(found)
++        if verbose:
++            print(f"[{vid}] {len(frames[vid])}")
++    return frames
+ 
+ 
+ def load_gt(stem, split):
+-    """YOLO normalized cxcywh -> absolute xyxy."""
++    """YOLO normalised cxcywh -> [(label, x1, y1, x2, y2), ...] absolute px."""
+     out = []
+     for line in (R / f'labels/{split}/{stem}.txt').read_text().split('\n'):
+         t = line.split()
+         if len(t) == 5:
+             c, cx, cy, w, h = int(t[0]), *map(float, t[1:])
+-            out.append((NAMES[c], (cx - w/2)*W, (cy - h/2)*H, (cx + w/2)*W, (cy + h/2)*H))
++            out.append((NAMES[c], (cx - w/2)*W, (cy - h/2)*H,
++                        (cx + w/2)*W, (cy + h/2)*H))
+     return out
+ 
++
+ def draw_boxes(img, boxes, width=2):
+     """boxes: list of (label, x1, y1, x2, y2). Returns a copy."""
+     out = img.copy()
+@@ -45,4 +50,4 @@ def draw_boxes(img, boxes, width=2):
+         col = COLORS.get(label, (255, 255, 0))
+         d.rectangle([x1, y1, x2, y2], outline=col, width=width)
+         d.text((x1 + 3, max(y1 - 12, 0)), label, fill=col)
+-    return out
+\ No newline at end of file
++    return out
+diff --git a/src/evaluation/__init__.py b/src/evaluation/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/evaluation/metrics.py b/src/evaluation/metrics.py
+new file mode 100644
+index 0000000..ebf25b1
+--- /dev/null
++++ b/src/evaluation/metrics.py
+@@ -0,0 +1,94 @@
++"""One evaluator for every method.
++
++COCO mAP plus centre-coverage. Both are reported because they answer
++different questions: mAP asks whether the box is right, centre-coverage asks
++whether we pointed at the object at all. On this dataset they diverge sharply
++(fire: 77.5% centre-coverage against AP 0.05), and for a platform that flies
++to a coordinate the second number is the operationally relevant one.
++"""
++from collections import Counter
++
++import torch
++from torchmetrics.detection import MeanAveragePrecision
++
++from ..constants import CLS, NAMES, W, H
++
++# 3 prompts x 100 cached queries = up to 300 detections/frame for SAM3.
++# torchmetrics defaults to [1, 10, 100] and SILENTLY DROPS the lowest-scoring
++# excess, biasing AP downward. Every method must use the same cap.
++MAX_DETS = [1, 10, 300]
++
++
++def _norm(dets):
++    """Accept Detection objects or dicts -> [(label, x1, y1, x2, y2, score)]."""
++    out = []
++    for d in dets:
++        if isinstance(d, dict):
++            label, bx, sc = d['label'], d['box'], d.get('confidence', 1.0)
++        else:
++            label, bx, sc = d.label, d.box, getattr(d, 'confidence', 1.0)
++        x1, y1, x2, y2 = bx
++        x1, x2 = max(0., min(float(x1), W)), max(0., min(float(x2), W))
++        y1, y2 = max(0., min(float(y1), H)), max(0., min(float(y2), H))
++        if x2 - x1 < 1 or y2 - y1 < 1:          # drop degenerate boxes
++            continue
++        out.append((label, x1, y1, x2, y2, float(sc)))
++    return out
++
++
++def _centre_hits(pred, gt, hit, tot):
++    for gl, gx1, gy1, gx2, gy2 in gt:
++        cx, cy = (gx1 + gx2) / 2, (gy1 + gy2) / 2
++        tot[gl] += 1
++        hit[gl] += any(pl == gl and x1 <= cx <= x2 and y1 <= cy <= y2
++                       for pl, x1, y1, x2, y2, _ in pred)
++
++
++def score(results, meta, load_gt, backend='pycocotools'):
++    """results: {key: [Detection|dict]}   meta: {key: (stem, split)}"""
++    metric = MeanAveragePrecision(
++        box_format='xyxy', iou_type='bbox', class_metrics=True,
++        backend=backend, max_detection_thresholds=MAX_DETS,
++    )
++    metric.warn_on_many_detections = False
++    hit, tot = Counter(), Counter()
++
++    for key, dets in results.items():
++        stem, split = meta[key]
++        gt = load_gt(stem, split)
++        pred = _norm(dets)
++        _centre_hits(pred, gt, hit, tot)
++
++        metric.update(
++            [dict(
++                boxes=torch.tensor([p[1:5] for p in pred],
++                                   dtype=torch.float32).reshape(-1, 4),
++                scores=torch.tensor([p[5] for p in pred], dtype=torch.float32),
++                labels=torch.tensor([CLS[p[0]] for p in pred], dtype=torch.int64),
++            )],
++            [dict(
++                boxes=torch.tensor([g[1:5] for g in gt],
++                                   dtype=torch.float32).reshape(-1, 4),
++                labels=torch.tensor([CLS[g[0]] for g in gt], dtype=torch.int64),
++            )],
++        )
++
++    m = metric.compute()
++    per = {}
++    for cid, ap in zip(m['classes'].tolist(), m['map_per_class'].tolist()):
++        c = NAMES[int(cid)]
++        per[c] = dict(ap=float(ap), centre_hit=hit[c], centre_total=tot[c],
++                      centre_cov=hit[c] / tot[c] if tot[c] else float('nan'))
++    return dict(frames=len(results), map_50=float(m['map_50']),
++                map=float(m['map']), mar_100=float(m['mar_100']),
++                per_class=per)
++
++
++def report(r, label=''):
++    print(f"{label}  frames={r['frames']}")
++    print(f"  mAP@50     {r['map_50']:.4f}")
++    print(f"  mAP@50:95  {r['map']:.4f}")
++    print(f"  mAR@100    {r['mar_100']:.4f}")
++    for c, v in r['per_class'].items():
++        print(f"    {c:<7} AP {v['ap']:.4f}   centre-cov "
++              f"{v['centre_hit']}/{v['centre_total']} = {v['centre_cov']:.3f}")
+-- 
+2.43.0
