@@ -2,11 +2,9 @@ anthropic>=0.40
 pydantic>=2.0
 pillow
 numpy
-pandas
 tqdm
 matplotlib
 python-dotenv
 torch
-torchvision
 torchmetrics>=1.4
-pycocotools
+faster-coco-eval
