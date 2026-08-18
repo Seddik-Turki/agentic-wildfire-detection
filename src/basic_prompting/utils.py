@@ -18,7 +18,7 @@ def trace(response):
             print(f"\n[👾] {b.text}\n")
 
         elif b.type == "server_tool_use":
-            print(f"\n[🐧] {b.input.get("command", b.input)}")
+            print(f"\n[🐧] {b.input.get('command', b.input)}")
 
         elif b.type == "bash_code_execution_tool_result":
             c = b.content

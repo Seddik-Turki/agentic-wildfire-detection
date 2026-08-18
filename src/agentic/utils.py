@@ -60,7 +60,7 @@ def trace(response):
             print(f"\n[👾] {b.text}\n")
 
         elif b.type == "server_tool_use":
-            print(f"\n[🐧] {b.input.get("command", b.input)}")
+            print(f"\n[🐧] {b.input.get('command', b.input)}")
 
         elif b.type == "bash_code_execution_tool_result":
             c = b.content
@@ -123,10 +123,12 @@ def commit(client, messages):
     return r.parsed_output.detections, r
 
 
-def run(client, messages, verbose=True):
+def run(client, stem, split, verbose=True):
     """Agentic loop, then commit. Always returns detections."""
     registry = {}
     container = None
+
+    messages = build_messages(client, stem, split)
 
     for turn in range(MAX_TURNS):
         if verbose:

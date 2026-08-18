@@ -25,8 +25,7 @@ def main():
 
 
     
-    messages = build_messages(client, stem, split)
-    dets = run(client, messages)
+    dets = run(client, stem, split)
 
     
     pred = [(d.label, *d.box) for d in dets]

@@ -11,3 +11,6 @@ __pycache__/
 # Data
 rgbt-3m/*
 !rgbt-3m/data.yaml
+
+# Results
+results/*
