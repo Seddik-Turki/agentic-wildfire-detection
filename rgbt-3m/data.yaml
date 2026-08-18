@@ -1,0 +1,15 @@
+# RGBT-3M — UAV RGB + thermal wildfire dataset (registered pairs, 640x480)
+# Paper: https://www.mdpi.com/2072-4292/17/15/2593
+#
+# rgb/ and thermal/ share ONE label set: the pairs are pixel-registered
+# (M-RIFT), so a box is valid in both modalities.
+# Labels are BOUNDING BOXES (LabelImg) — there are no segmentation masks.
+# NOTE: thermal frames have no smoke labels; their H20T couldn't resolve
+# smoke at range, so class 0 is effectively RGB-only.
+
+train: rgb/train
+val: rgb/test
+names:
+  0: smoke
+  1: fire
+  2: person

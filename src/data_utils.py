@@ -1,17 +1,22 @@
 from pathlib import Path
 import re
+import base64
 
 from PIL import ImageDraw
 
-from .constants import NAMES, W, H
+from src.constants import NAMES, W, H
 
-# Single source of truth. This previously resolved to src/rgbt-3m while
-# main.py resolved <root>/rgbt-3m, so labels and images came from different
-# directories.
+
 R = Path(__file__).parents[1] / "rgbt-3m"
 
 COLORS = {'smoke': (128, 200, 255), 'fire': (255, 80, 0), 'person': (0, 255, 120)}
 VIDEOS = [2, 3, 4, 5]
+
+
+
+def encode_raw(path):
+    """Send original JPEG bytes — no re-encode, no second lossy pass."""
+    return base64.b64encode(Path(path).read_bytes()).decode()
 
 
 def load_frames(videos=VIDEOS, verbose=True):

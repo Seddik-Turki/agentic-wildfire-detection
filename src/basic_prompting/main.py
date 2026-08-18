@@ -3,46 +3,21 @@
     python -m src.basic_prompting.main
 """
 import random
+from pathlib import Path
 
 from dotenv import load_dotenv
 from PIL import Image
 import matplotlib.pyplot as plt
 import anthropic
 
-from ..data_utils import R, load_frames, load_gt, draw_boxes
-from ..schema import DetectionResult
-from .utils import encode_raw
-from .prompt import PROMPT
-from .constants import MODEL, MAX_TOKENS
+from src.data_utils import load_frames, load_gt, draw_boxes
+from src.basic_prompting.utils import detect, trace
 
 load_dotenv()
 client = anthropic.Anthropic()
 
+R = Path(__file__).parents[2] / "rgbt-3m"
 
-def detect(stem, split, client=client):
-    """One frame -> (detections, raw response)."""
-    r = client.messages.parse(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        thinking={"type": "adaptive", "display": "summarized"},
-        output_config={"effort": "high"},
-        output_format=DetectionResult,
-        messages=[{
-            'role': 'user',
-            'content': [
-                {'type': 'text', 'text': 'Image 1 — RGB:'},
-                {'type': 'image', 'source': {
-                    'type': 'base64', 'media_type': 'image/jpeg',
-                    'data': encode_raw(R / f'rgb/{split}/{stem}.jpg')}},
-                {'type': 'text', 'text': 'Image 2 — Thermal (LWIR):'},
-                {'type': 'image', 'source': {
-                    'type': 'base64', 'media_type': 'image/jpeg',
-                    'data': encode_raw(R / f'thermal/{split}/{stem}.jpg')}},
-                {'type': 'text', 'text': PROMPT},
-            ],
-        }],
-    )
-    return r.parsed_output.detections, r
 
 
 def main():
@@ -50,7 +25,8 @@ def main():
     _, stem, split = random.choice(frames[f'video{random.choice([2, 3, 4, 5])}'])
     print(f"frame: {stem} ({split})")
 
-    dets, resp = detect(stem, split)
+    dets, resp = detect(client, stem, split)
+    trace(resp)
     print('tokens:', resp.usage.input_tokens, '->', resp.usage.output_tokens)
     for d in dets:
         print(f"  {d.label:7} {d.confidence:.2f}  {d.box}")

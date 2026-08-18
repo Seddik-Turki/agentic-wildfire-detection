@@ -7,3 +7,7 @@ __pycache__/
 *$py.class
 .pytest_cache/
 .mypy_cache/
+
+# Data
+rgbt-3m/*
+!rgbt-3m/data.yaml
