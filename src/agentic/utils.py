@@ -104,64 +104,61 @@ def build_messages(client, stem, split):
 
 
 
+def commit(client, messages):
+    """Final call: no tools, structured output."""
+    messages.append({
+        'role': 'user',
+        'content': [{'type': 'text', 'text': BBOX_PROMPT}],
+    })
+    r = client.beta.messages.parse(
+        model=MODEL,
+        max_tokens=MAX_TOKENS,
+        thinking={"type": "adaptive", "display": "summarized"},
+        output_config={"effort": THINKING_EFFORT},
+        output_format=DetectionResult,
+        messages=messages,
+        betas=BETAS,
+    )
+    trace(r)
+    return r.parsed_output.detections, r
 
-def run(client, messages):
+
+def run(client, messages, verbose=True):
+    """Agentic loop, then commit. Always returns detections."""
     registry = {}
     container = None
 
-
-    for turn in tqdm(range(MAX_TURNS)):
-        print(f"\n{'=' * 60}\nTURN {turn}\n{'=' * 60}")
+    for turn in range(MAX_TURNS):
+        if verbose:
+            print(f"\n{'=' * 60}\nTURN {turn}\n{'=' * 60}")
         kwargs = {"container": container} if container else {}
-        
+
         r = client.beta.messages.create(
-            model=MODEL, 
+            model=MODEL,
             max_tokens=MAX_TOKENS,
             thinking={"type": "adaptive", "display": "summarized"},
             output_config={"effort": THINKING_EFFORT},
-            betas=BETAS, 
-            
-            tools=[CODE_EXEC_TOOL,ATTACH_TOOL],
-            messages=messages, 
+            betas=BETAS,
+            tools=[CODE_EXEC_TOOL, ATTACH_TOOL],
+            messages=messages,
             **kwargs,
         )
-        trace(r)
-        print(f"stop={r.stop_reason}  tokens={r.usage.input_tokens}in/"
-              f"{r.usage.output_tokens}out")
+        if verbose:
+            trace(r)
+            print(f"stop={r.stop_reason}  tokens={r.usage.input_tokens}in/"
+                  f"{r.usage.output_tokens}out")
 
         if r.container:
             container = r.container.id
-        harvest(client, r, registry)
+        harvest(client, r, registry, verbose=verbose)
         messages.append({"role": "assistant", "content": r.content})
 
         if r.stop_reason == "pause_turn":
             continue
 
         calls = [b for b in r.content if b.type == "tool_use"]
-
         if not calls:
-            messages.append({
-                    'role': 'user',
-                    'content': [
-                        {'type': 'text', 'text': BBOX_PROMPT},
-                    ],
-                })
-            
-            r = client.beta.messages.parse(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                thinking={"type": "adaptive", "display": "summarized"},
-                output_config={"effort": THINKING_EFFORT},
-                output_format=DetectionResult,
-                messages=messages,
-                betas=BETAS
-            )
-
-            trace(r)
-
-
-            dets = r.parsed_output.detections
-            return dets
+            break
 
         results = []
         for b in calls:
@@ -169,12 +166,14 @@ def run(client, messages):
                 out = attach_image(b.input["filename"], registry)
             else:
                 out = {"content": f"Unknown tool: {b.name}", "is_error": True}
-
-            print(f"   [result] {b.input.get('filename')} "
-                  f"{'ERROR: ' + out['content'] if out['is_error'] else 'ok'}")
-            
+            if verbose:
+                print(f"   [result] {b.input.get('filename')} "
+                      f"{'ERROR: ' + out['content'] if out['is_error'] else 'ok'}")
             results.append({"type": "tool_result", "tool_use_id": b.id, **out})
-        
         messages.append({"role": "user", "content": results})
+    else:
+        if verbose:
+            print(f"\n--- TURN LIMIT ({MAX_TURNS}) ---")
 
-    print("\nregistry:", list(registry))
+    dets, _ = commit(client, messages)
+    return dets
