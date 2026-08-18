@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 
 from src.data_utils import load_frames, load_gt, draw_boxes
 from src.agentic.utils import run, build_messages
-
+from src.data_utils import R
 
 
 from dotenv import load_dotenv
@@ -13,8 +13,6 @@ load_dotenv()
 
 import anthropic
 client = anthropic.Anthropic()
-
-R = Path(__file__).parents[2] / "rgbt-3m"
 
 
 def main():

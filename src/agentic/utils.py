@@ -5,9 +5,7 @@ from src.agentic.constants import BETAS, MAX_TOKENS, MAX_TURNS, MODEL, THINKING_
 from src.agentic.tools import CODE_EXEC_TOOL,ATTACH_TOOL
 from src.agentic.prompt import PROMPT, BBOX_PROMPT
 from src.schema import DetectionResult
-from src.data_utils import encode_raw
-
-R = Path(__file__).parents[2] / "rgbt-3m"
+from src.data_utils import encode_raw, R
 
 
 def upload(client, path, label):
@@ -97,7 +95,7 @@ def build_messages(client, stem, split):
             # Container Uploaded Files
             {"type": "container_upload", "file_id": rgb_file.id},
             {"type": "container_upload", "file_id": thermal_file.id},
-            
+
             # cached: images + prompt are re-sent on every turn
             {'type': 'text', 'text': PROMPT,
              'cache_control': {'type': 'ephemeral'}},

@@ -1,11 +1,9 @@
 from pathlib import Path
 
 from src.schema import DetectionResult
-from src.data_utils import encode_raw
+from src.data_utils import encode_raw, R
 from src.basic_prompting.prompt import PROMPT
 from src.basic_prompting.constants import MODEL, MAX_TOKENS
-
-R = Path(__file__).parents[2] / "rgbt-3m"
 
 
 

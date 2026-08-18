@@ -10,15 +10,11 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import anthropic
 
-from src.data_utils import load_frames, load_gt, draw_boxes
+from src.data_utils import load_frames, load_gt, draw_boxes, R
 from src.basic_prompting.utils import detect, trace
 
 load_dotenv()
 client = anthropic.Anthropic()
-
-R = Path(__file__).parents[2] / "rgbt-3m"
-
-
 
 def main():
     frames = load_frames()
