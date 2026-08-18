@@ -4,7 +4,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 
 from src.data_utils import load_frames, load_gt, draw_boxes
-from src.agentic.utils import run, build_messages
+from src.agentic.utils import run
 from src.data_utils import R
 
 
@@ -25,7 +25,7 @@ def main():
 
 
     
-    dets = run(client, stem, split)
+    dets, _ = run(client, stem, split)
 
     
     pred = [(d.label, *d.box) for d in dets]
