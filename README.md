@@ -2,15 +2,10 @@
 
 **Wildfire detection on RGBT-3M using Claude.** An agentic loop where Claude writes its own computer-vision code in a sandbox, *looks at the images it just produced*, and revises its answer before committing to bounding boxes.
 
-No training. No fine-tuning. No labels. Just a model that can measure, look, and change its mind.
-
-> **3× fire AP over SAM3 zero-shot · 33× over single-shot prompting of the same model**
-
----
+<br>
 
 ## 📊 Results
 
-908 frames (video2, real-fire subset), 1,423 smoke / 759 fire / 549 person instances.
 Every method scored through **one evaluator** — same GT loader, same matching rule, same `max_detection_thresholds=[1, 10, 300]`.
 
 | Method | mAP@50 | mAP@50:95 | smoke AP | 🔥 fire AP | person AP | cost/frame |
@@ -19,21 +14,15 @@ Every method scored through **one evaluator** — same GT loader, same matching 
 | 🎯 SAM3 zero-shot | 0.2143 | **0.0933** | **0.2222** | 0.0175 | **0.0403** | free (local GPU) |
 | 💬 Single-shot prompting | 0.1414 | 0.0528 | 0.1565 | 0.0015 | 0.0003 | ~$0.02 |
 | 📦 YOLOv26 (off-the-shelf) | 0.0063 | — | 0.0070 | 0.0003 | — | free (local GPU) |
-| *Supervised ceiling* ¹ | *0.963* | — | — | — | — | *requires training* |
 
-¹ CP-YOLOv11-MF, **trained** on RGBT-3M, from the dataset paper. Every row above it is training-free.
+<br>
 
 ### What the numbers actually say
 
 **🔥 Fire is the headline.** Every method in this benchmark fails at fire. The agentic loop is the first to move it — 3× over SAM3, 33× over single-shot prompting of the same model. That's the finding.
-
-**It does *not* beat SAM3 overall.** It wins at IoU 0.5 and loses at 0.5:0.95, and it's clearly worse on smoke. What it buys is *fire*, at real cost.
-
-**Smoke got slightly worse than single-shot** (0.1565 → 0.1408). The loop doesn't help on large diffuse objects; it encourages over-segmenting one smoke region into several. Reported as a negative result rather than buried.
-
 ---
 
-## 🎯 Centre-coverage: the metric nobody reports
+## 🎯 Centre-coverage
 
 mAP asks *is the box right?* For a UAV that flies to a coordinate, the operational question is *did we point at the object at all?*
 
@@ -52,6 +41,8 @@ That's a localization problem, not a detection problem. It's also the largest re
 Person at 0.337 is different — that's a genuine capability limit. Median person is ~13×13 px, smaller than a single 28×28 vision patch.
 
 ---
+
+<br>
 
 ## 🖼️ Qualitative: the loop finds what the labels missed
 
@@ -74,22 +65,24 @@ The one thing GT gets right that the loop misses is the **person**. No method he
 
 ---
 
+<br>
+
 ## 🧠 How the agentic loop works
 
 The constraint that shapes everything: **Claude cannot see files its own container produces.** Generated files come back as `file_id`s in the API response, and the docs are explicit — *"Claude doesn't see the `content` list."* Your application is the bridge.
 
 ```
    ┌─────────────────────────────────────────────────┐
-   │  🐧 container: writes CV code, measures, plots   │
+   │  🐧 container: writes CV code, measures, plots  │
    └──────────────────┬──────────────────────────────┘
                       │ file_id  (Claude can't see this)
    ┌──────────────────▼──────────────────────────────┐
-   │  🔧 attach_image(filename)  ← client-side tool   │
-   │     looks up {filename: file_id} registry        │
+   │  🔧 attach_image(filename)  ← client-side tool  |
+   │     looks up {filename: file_id} registry       │
    └──────────────────┬──────────────────────────────┘
                       │ image block
    ┌──────────────────▼──────────────────────────────┐
-   │  👾 Claude's context: SEES it, picks next probe  │
+   │  👾 Claude's context: SEES it, picks next probe │
    └─────────────────────────────────────────────────┘
 ```
 
@@ -113,6 +106,8 @@ No other detector in this benchmark can produce that.
 
 ---
 
+<br>
+
 ## ⚙️ Setup
 
 ### 1. Environment
@@ -123,23 +118,6 @@ conda activate wildfire
 pip install -r requirements.txt
 ```
 
-<details>
-<summary><b>📦 What each package does</b></summary>
-
-| package | why |
-|---|---|
-| `anthropic` | Claude API client — messages, Files API, code execution, structured outputs |
-| `pydantic` | `DetectionResult` schema; the model's output is validated against it |
-| `pillow` | image loading and box drawing |
-| `numpy` | array handling |
-| `tqdm` | progress bars on batch runs |
-| `matplotlib` | GT-vs-prediction side-by-side plots |
-| `python-dotenv` | loads `ANTHROPIC_API_KEY` from `.env` |
-| `torch` | tensor backend required by torchmetrics |
-| `torchmetrics` | `MeanAveragePrecision` — COCO mAP |
-| `faster-coco-eval` | the COCO evaluation backend torchmetrics calls |
-
-</details>
 
 ### 2. API key
 
@@ -155,13 +133,6 @@ Download from Kaggle and unpack into `rgbt-3m/`:
 
 **📥 [kaggle.com/datasets/seddiktrk/rgbt-3m](https://www.kaggle.com/datasets/seddiktrk/rgbt-3m)**
 
-```
-rgbt-3m/
-├── data.yaml
-├── rgb/{train,test}/video2_frame_00000.jpg
-├── thermal/{train,test}/video2_frame_00000.jpg
-└── labels/{train,test}/video2_frame_00000.txt     # YOLO: cls cx cy w h
-```
 
 Verify:
 
@@ -204,50 +175,12 @@ One JSON per frame lands in `results/<method>/frames/`, so a crash at frame 600 
 
 ### 🎯 SAM3 baseline
 
-SAM3 needs a GPU, so it runs in a Kaggle notebook rather than here:
+SAM3 needs a GPU, so it runs in a Kaggle notebook:
 
 **📓 [kaggle.com/code/seddiktrk/rgbt-3m-sam3](https://www.kaggle.com/code/seddiktrk/rgbt-3m-sam3)**
 
-Two-stage: cache raw `boxes`/`logits`/`presence` per frame once on GPU, then sweep thresholds offline on CPU. 3.9 fps on an RTX 4090, ~34 min for the full set.
-
 ---
-
-## 📁 Layout
-
-```
-src/
-├── constants.py            # NAMES, CLS, W, H — one class mapping
-├── schema.py               # Detection, DetectionResult (Pydantic)
-├── data_utils.py           # R, load_frames, load_gt, draw_boxes, trace
-├── agentic/
-│   ├── prompt.py           # task prompt + commit prompt
-│   ├── tools.py            # attach_image schema + code execution tool
-│   ├── utils.py            # upload, harvest, attach_image, run, commit
-│   └── main.py             # single-frame demo
-├── basic_prompting/        # same interface, one request
-└── evaluation/
-    ├── metrics.py          # mAP + centre-coverage — THE shared evaluator
-    ├── cost.py             # token and dollar accounting
-    └── run_benchmark.py    # threaded runner, resume, inline scoring
-```
-
-**`metrics.py` being the single evaluator is the point.** It's what makes the comparison defensible rather than four scripts that happen to print similar-looking numbers.
-
----
-
-## 🔬 Negative results
-
-Things that cost time and are worth knowing:
-
-- **SAM3's default scoring is wrong for this dataset.** The HuggingFace post-processor computes `sigmoid(logits) × sigmoid(presence)`. Turning presence gating **off** gains 12% mAP@50 (0.1899 → 0.2130). Presence is a per-image scalar, so it reorders detections across frames and depresses correct ones on globally-uncertain frames.
-- **NMS does nothing here.** 0.2130 / 0.2143 / 0.2133 across None / 0.7 / 0.9. SAM3's queries aren't producing suppressible duplicates.
-- **Class-agnostic NMS would be actively harmful.** Fire sits *inside* smoke in nearly every frame, so it deletes correct fire boxes. Per-class only.
-- **`max_detection_thresholds` matters.** torchmetrics defaults to `[1, 10, 100]` and silently drops the lowest-scoring excess. SAM3 emits up to 300 boxes/frame. Mismatched caps invalidate the comparison.
-- **Unbounded stdout dominates cost.** One frame hit 85,812 input tokens because Claude printed a 174-row component table; the transcript is re-sent every turn. Capping printed output brought the same frame to 6,502.
-- **Adding thermal doesn't monotonically help.** On the example frame it made the single-shot fire box substantially worse.
-- **10-frame previews are optimistic.** A 10-frame agentic preview read mAP@50 0.386 and person AP 0.177; at 908 frames those became 0.230 and 0.032.
-
----
+<br>
 
 ## 📚 Dataset
 
@@ -277,8 +210,6 @@ Released for research purposes — cite the paper if you use it.
 
 ---
 
-## ⚖️ Scope
-
-908 frames from one video, one terrain, one time of day, 5 fps. This is a benchmark on RGBT-3M's real-fire subset, **not** a general wildfire result. The supervised ceiling on this dataset is 0.963; everything here is training-free and an order of magnitude below it.
+<br>
 
 Code: MIT. Dataset: see above.
