@@ -15,17 +15,23 @@ def upload(client, path, label):
         )
 
 
-def cleanup(client, files):
-    """Uploads persist workspace-wide; without this they accumulate."""
-    for f in files:
+def cleanup(client, file_ids):
+    """Both the uploads AND the files the container captured persist
+    workspace-wide; without this they accumulate at ~10/frame."""
+    for fid in file_ids:
         try:
-            client.beta.files.delete(f.id)
+            client.beta.files.delete(fid)
         except Exception as e:
-            print(f"   [cleanup] {f.id}: {type(e).__name__}")
+            print(f"   [cleanup] {fid}: {type(e).__name__}")
 
 
 def harvest(client, response, registry, verbose=True):
-    """Add every file the container captured to the filename -> file_id map."""
+    """Add every file the container captured to the filename -> file_id map.
+
+    Returns the ids seen this turn. The registry alone is not enough to clean
+    up: re-using a filename overwrites its entry and orphans the earlier id.
+    """
+    seen = []
     for block in response.content:
         if block.type != "bash_code_execution_tool_result":
             continue
@@ -35,8 +41,10 @@ def harvest(client, response, registry, verbose=True):
         for out in c.content:
             meta = client.beta.files.retrieve_metadata(out.file_id)
             registry[meta.filename] = out.file_id
+            seen.append(out.file_id)
             if verbose:
                 print(f"   [registry] {meta.filename} -> {out.file_id}")
+    return seen
 
 
 def attach_image(filename, registry):
@@ -82,7 +90,7 @@ def trace(response):
 
 
 def build_messages(client, stem, split):
-    """-> (messages, uploaded_files). Caller must cleanup() the files."""
+    """-> (messages, uploaded_files). Caller must cleanup() their ids."""
     rgb_file = upload(client, R / f'rgb/{split}/{stem}.jpg', "rgb")
     thermal_file = upload(client, R / f'thermal/{split}/{stem}.jpg', "thermal")
 
@@ -144,7 +152,7 @@ def _note(turns, r, i, bash=0, attach=0):
 
 def run(client, stem, split, verbose=True):
     """Agentic loop, then commit. -> (detections, turns). Always cleans up."""
-    registry, container, turns = {}, None, []
+    registry, container, turns, captured = {}, None, [], []
     messages, files = build_messages(client, stem, split)
 
     try:
@@ -174,7 +182,7 @@ def run(client, stem, split, verbose=True):
 
             if r.container:
                 container = r.container.id
-            harvest(client, r, registry, verbose=verbose)
+            captured += harvest(client, r, registry, verbose=verbose)
             messages.append({"role": "assistant", "content": r.content})
 
             if r.stop_reason == "pause_turn":
@@ -204,4 +212,6 @@ def run(client, stem, split, verbose=True):
         return dets, turns
 
     finally:
-        cleanup(client, files)
+        # Runs after commit() has returned the detections, so nothing is
+        # deleted while it may still be referenced.
+        cleanup(client, [f.id for f in files] + captured)

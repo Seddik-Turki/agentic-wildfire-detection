@@ -73,13 +73,20 @@ def parse_args():
     return ap.parse_args()
 
 
-def run_inference(args, out):
+def select(args):
+    """The frames this invocation is about -> [(idx, stem, split), ...].
+
+    Inference and scoring both derive from this, so --videos/--stride/--limit
+    mean the same thing to each. Scoring a different set than you ran is how a
+    --limit 5 check silently reports the numbers of a previous full run.
+    """
     vids = [int(v.replace('video', '')) for v in args.videos]
     frames = load_frames(vids, verbose=False)
     sample = [f for v in vids for f in frames[f'video{v}']][::args.stride]
-    if args.limit:
-        sample = sample[:args.limit]
+    return sample[:args.limit] if args.limit else sample
 
+
+def run_inference(args, out, sample):
     todo = [(stem, split) for _, stem, split in sample
             if not (out / 'frames' / f'{stem}.json').exists()]
     print(f'{len(sample)} frames, {len(todo)} to do, {args.workers} workers')
@@ -122,13 +129,21 @@ def run_inference(args, out):
         (out / 'failures.json').write_text(json.dumps(fail, indent=2))
 
 
-def load_run(out):
+def load_run(out, stems):
+    """Load exactly the selected frames — not everything left on disk."""
     results, meta, turnlogs = {}, {}, {}
-    for f in sorted((out / 'frames').glob('*.json')):
-        rec = json.loads(f.read_text())
+    missing = 0
+    for stem in stems:
+        p = out / 'frames' / f'{stem}.json'
+        if not p.exists():
+            missing += 1
+            continue
+        rec = json.loads(p.read_text())
         results[rec['stem']] = rec['dets']
         meta[rec['stem']] = (rec['stem'], rec['split'])
         turnlogs[rec['stem']] = rec['turns']
+    if missing:
+        print(f'{missing} selected frames absent from disk, not scored')
     return results, meta, turnlogs
 
 
@@ -137,10 +152,11 @@ def main():
     out = args.out or Path(f'results/{args.method}')
     (out / 'frames').mkdir(parents=True, exist_ok=True)
 
+    sample = select(args)
     if not args.score_only:
-        run_inference(args, out)
+        run_inference(args, out, sample)
 
-    results, meta, turnlogs = load_run(out)
+    results, meta, turnlogs = load_run(out, [stem for _, stem, _ in sample])
     if not results:
         print('nothing to score')
         return

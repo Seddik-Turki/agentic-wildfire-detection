@@ -24,17 +24,30 @@ from src.constants import CLS, NAMES, W, H
 MAX_DETS = [1, 10, 300]
 
 
+def _fit(x1, y1, x2, y2):
+    """Order the corners, then clamp to the frame.
+
+    Ordering first matters: a model that emits [x2, y2, x1, y1] is a routine
+    slip, and clamping a reversed box leaves it degenerate, so it used to be
+    dropped silently. Applied to GT as well — clamping only predictions gives
+    an edge-touching GT box more area than any prediction can cover, which
+    costs IoU on exactly the boxes that are hardest to get right.
+    """
+    x1, x2 = sorted((float(x1), float(x2)))
+    y1, y2 = sorted((float(y1), float(y2)))
+    return (max(0., min(x1, W)), max(0., min(y1, H)),
+            max(0., min(x2, W)), max(0., min(y2, H)))
+
+
 def _norm(dets):
-    """Detection objects or dicts -> [(label, x1, y1, x2, y2, score)], clamped."""
+    """Detection objects or dicts -> [(label, x1, y1, x2, y2, score)], fitted."""
     out = []
     for d in dets:
         if isinstance(d, dict):
             label, bx, sc = d['label'], d['box'], d.get('confidence', 1.0)
         else:
             label, bx, sc = d.label, d.box, getattr(d, 'confidence', 1.0)
-        x1, y1, x2, y2 = bx
-        x1, x2 = max(0., min(float(x1), W)), max(0., min(float(x2), W))
-        y1, y2 = max(0., min(float(y1), H)), max(0., min(float(y2), H))
+        x1, y1, x2, y2 = _fit(*bx)
         if x2 - x1 < 1 or y2 - y1 < 1:          # drop degenerate boxes
             continue
         out.append((label, x1, y1, x2, y2, float(sc)))
@@ -49,11 +62,13 @@ def score(results, meta, load_gt, backend='faster_coco_eval'):
     )
     metric.warn_on_many_detections = False
     hit, tot = Counter(), Counter()
+    dropped = 0
 
     for key, dets in results.items():
         stem, split = meta[key]
-        gt = load_gt(stem, split)
+        gt = [(g[0], *_fit(*g[1:5])) for g in load_gt(stem, split)]
         pred = _norm(dets)
+        dropped += len(dets) - len(pred)
 
         for gl, gx1, gy1, gx2, gy2 in gt:
             cx, cy = (gx1 + gx2) / 2, (gy1 + gy2) / 2
@@ -86,7 +101,7 @@ def score(results, meta, load_gt, backend='faster_coco_eval'):
     # torchmetrics emits mar_1 / mar_10 / mar_300, and there is no mar_100.
     return dict(frames=len(results), map_50=float(m['map_50']),
                 map=float(m['map']), mar=float(m[f'mar_{MAX_DETS[-1]}']),
-                per_class=per)
+                dropped_preds=dropped, per_class=per)
 
 
 def report(r, label=''):
@@ -94,6 +109,8 @@ def report(r, label=''):
     print(f"  mAP@50     {r['map_50']:.4f}")
     print(f"  mAP@50:95  {r['map']:.4f}")
     print(f"  mAR@{MAX_DETS[-1]}    {r['mar']:.4f}")
+    if r.get('dropped_preds'):
+        print(f"  dropped    {r['dropped_preds']} degenerate predictions")
     for c, v in r['per_class'].items():
         # torchmetrics returns -1 as a sentinel for "no GT of this class"
         ap = 'n/a' if v['ap'] < 0 else f"{v['ap']:.4f}"
