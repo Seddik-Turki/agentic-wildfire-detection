@@ -3,11 +3,11 @@
     python -m src.basic_prompting.main
 """
 import random
-from pathlib import Path
 
-from dotenv import load_dotenv
 from PIL import Image
 import matplotlib.pyplot as plt
+
+from dotenv import load_dotenv
 import anthropic
 
 from src.data_utils import load_frames, load_gt, draw_boxes, R

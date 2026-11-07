@@ -68,3 +68,7 @@ Invariants that keep the comparison valid across methods (including the external
 - Pricing constants in `cost.py` are Opus 5 USD/Mtok. `usage.input_tokens` already excludes cache reads — don't subtract them.
 - Every detection carries a `description` field explaining the visual evidence; the prompts require it, and it's part of the project's story.
 - Comments here explain *why* a non-obvious choice was made (rate-limit ramping, cleanup ordering, detection caps). Match that register rather than narrating what the code does.
+
+
+## Secrets
+Never read `.env` or key files. If you need a config value, ask.

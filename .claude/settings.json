@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m pytest:*)",
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Read(./**)"
+    ],
+
+    "deny": [
+      "Bash(sudo:*)"
+    ]
+  }
+}

@@ -1,10 +1,7 @@
-from pathlib import Path
-
 from src.schema import DetectionResult
 from src.data_utils import encode_raw, R
 from src.basic_prompting.prompt import PROMPT
-from src.basic_prompting.constants import MODEL, MAX_TOKENS
-
+from src.basic_prompting.constants import MODEL, MAX_TOKENS, THINKING_EFFORT
 
 
 def trace(response):
@@ -37,7 +34,7 @@ def detect(client, stem, split):
         model=MODEL,
         max_tokens=MAX_TOKENS,
         thinking={"type": "adaptive", "display": "summarized"},
-        output_config={"effort": "high"},
+        output_config={"effort": THINKING_EFFORT},
         output_format=DetectionResult,
         messages=[{
             'role': 'user',
